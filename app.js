@@ -16,6 +16,7 @@
   let editMode = false;
   let crawlAbort = null;
   let currentExport = 'xml';
+  let initialized = false;
 
   const STORAGE_KEY = 'siteplan:v3';
   const MAX_URLS_PER_SITEMAP = 45000;
@@ -23,11 +24,230 @@
   const HTML_EXTS = /\.(html?|php|htm|xhtml)$/i;
   const INTERNAL_SEGMENTS = ['api', '_next', '_nuxt', '_astro', '_app', '__next', 'wp-admin', 'wp-includes', '.git', 'node_modules', '.next', 'dist', 'build', 'vendor', '.cache', '__pycache__'];
 
-  const CORS_PROXIES = [
-    (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-    (u) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-    (u) => `https://cors.eu.org/${u}`,
+  const CRAWL_TIMEOUT_MS = 15000;
+  const PROXY_HEALTH_URL = 'api/health';
+  const PROXY_FETCH_URL = 'api/fetch';
+
+  /**
+   * Public CORS proxies, used only when the local proxy (server.js) is not available.
+   * Order matters: fastest / most reliable first, services that refuse HTML last.
+   */
+  const PUBLIC_PROXIES = [
+    { name: 'allorigins', json: true, build: (u) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}` },
+    { name: 'codetabs', build: (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}` },
+    { name: 'cors.lol', build: (u) => `https://api.cors.lol/?url=${encodeURIComponent(u)}` },
+    { name: 'allorigins-raw', build: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
+    { name: 'corsproxy.io', build: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
   ];
+
+  // ---------- Network layer ----------
+  // Two transports: a local Node proxy (no CORS limits, supports auth headers)
+  // and public CORS proxies as a fallback. Every request has a hard timeout so
+  // the crawler can never hang forever on a dead proxy.
+  const proxyState = { local: false, checked: false, checking: null };
+  // Consecutive failures per proxy: after 3, stop wasting time on it.
+  const proxyFails = new Map();
+  let localProxyFails = 0;
+
+  function isAbortError(err, signal) {
+    return (signal && signal.aborted) || (err && (err.name === 'AbortError' || err.name === 'TimeoutError'));
+  }
+
+  /** AbortSignal linked to a parent signal, with its own timeout. */
+  function linkedSignal(parent, ms) {
+    const ctrl = new AbortController();
+    let reason = null;
+    const onAbort = () => { reason = 'aborted'; ctrl.abort(); };
+    if (parent) {
+      if (parent.aborted) onAbort();
+      else parent.addEventListener('abort', onAbort, { once: true });
+    }
+    const timer = setTimeout(() => { reason = 'timeout'; ctrl.abort(); }, ms);
+    return {
+      signal: ctrl.signal,
+      reason: () => reason,
+      cleanup: () => {
+        clearTimeout(timer);
+        if (parent) parent.removeEventListener('abort', onAbort);
+      },
+    };
+  }
+
+  const sleep = (ms, signal) => new Promise((resolve) => {
+    if (signal && signal.aborted) return resolve();
+    const t = setTimeout(resolve, ms);
+    if (signal) signal.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
+  });
+
+  async function probeLocalProxy(force = false) {
+    if (proxyState.checked && !force) return proxyState.local;
+    if (proxyState.checking && !force) return proxyState.checking;
+    proxyState.checking = (async () => {
+      let ok = false;
+      if (location.protocol === 'http:' || location.protocol === 'https:') {
+        try {
+          const s = linkedSignal(null, 2500);
+          const r = await fetch(PROXY_HEALTH_URL, { signal: s.signal, cache: 'no-store' });
+          s.cleanup();
+          if (r.ok) {
+            const data = await r.json().catch(() => ({}));
+            ok = !!(data && data.ok);
+          }
+        } catch { ok = false; }
+      }
+      proxyState.local = ok;
+      proxyState.checked = true;
+      proxyState.checking = null;
+      updateProxyBadge();
+      return ok;
+    })();
+    return proxyState.checking;
+  }
+
+  function updateProxyBadge() {
+    const dot = $('#proxyDot');
+    const label = $('#proxyLabel');
+    if (!dot || !label) return;
+    dot.classList.remove('on', 'off', 'pending');
+    if (!proxyState.checked) {
+      dot.classList.add('pending');
+      label.textContent = 'Vérification du proxy local…';
+      return;
+    }
+    if (proxyState.local) {
+      dot.classList.add('on');
+      label.innerHTML = 'Proxy local actif — crawl fiable, <strong>cookies et authentification possibles</strong>.';
+    } else {
+      dot.classList.add('off');
+      label.innerHTML = 'Proxys publics — certains sites bloquent/limitent. Pour un crawl fiable' +
+        ' (et les sites protégés) : <code>node server.js</code> en local, ou un déploiement Netlify (fonctions incluses).';
+    }
+  }
+
+  /** Auth headers typed by the user (local proxy only). */
+  function getCrawlHeaders() {
+    const out = {};
+    const cookie = ($('#crawlCookie')?.value || '').trim();
+    const auth = ($('#crawlAuthorization')?.value || '').trim();
+    const ua = ($('#crawlUserAgent')?.value || '').trim();
+    if (cookie) out.Cookie = cookie;
+    if (auth) out.Authorization = /^(basic|bearer|token)\s/i.test(auth) ? auth : `Bearer ${auth}`;
+    if (ua) out['User-Agent'] = ua;
+    return out;
+  }
+
+  async function fetchViaLocalProxy(url, headers, signal) {
+    const s = linkedSignal(signal, CRAWL_TIMEOUT_MS + 10000);
+    try {
+      const r = await fetch(PROXY_FETCH_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, headers }),
+        signal: s.signal,
+      });
+      const data = await r.json().catch(() => null);
+      if (!r.ok || !data || data.error) {
+        throw new Error((data && data.error) || `proxy local HTTP ${r.status}`);
+      }
+      return {
+        status: data.status || 200,
+        body: typeof data.body === 'string' ? data.body : '',
+        contentType: data.contentType || '',
+        finalUrl: data.finalUrl || url,
+        via: 'proxy local',
+      };
+    } finally { s.cleanup(); }
+  }
+
+  async function fetchViaPublicProxy(proxy, url, signal) {
+    const s = linkedSignal(signal, CRAWL_TIMEOUT_MS);
+    try {
+      const r = await fetch(proxy.build(url), { signal: s.signal, redirect: 'follow', cache: 'no-store' });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (proxy.json) {
+        let data = null;
+        try { data = JSON.parse(text); } catch { throw new Error('réponse illisible'); }
+        if (!data || typeof data.contents !== 'string') throw new Error('réponse illisible');
+        return {
+          status: (data.status && data.status.http_code) || 200,
+          body: data.contents,
+          contentType: '',
+          finalUrl: (data.status && data.status.url) || url,
+          via: proxy.name,
+        };
+      }
+      return { status: r.status, body: text, contentType: r.headers.get('content-type') || '', finalUrl: url, via: proxy.name };
+    } finally { s.cleanup(); }
+  }
+
+  /** Detect proxy error pages / bot walls that would otherwise look like a valid page. */
+  function detectBlockedPage(body) {
+    if (!body || body.length > 400000) return null;
+    const head = body.slice(0, 20000).toLowerCase();
+    if (head.includes('cf-browser-verification') || head.includes('just a moment...') || head.includes('attention required! | cloudflare')) {
+      return 'page protégée par Cloudflare (challenge anti-bot)';
+    }
+    if (head.includes('enable javascript and cookies to continue')) return 'page protégée par un challenge JavaScript';
+    if (head.includes('too many requests') && body.length < 3000) return 'proxy saturé (trop de requêtes)';
+    return null;
+  }
+
+  /**
+   * Fetch a page through the best available transport.
+   * Returns {status, body, contentType, finalUrl, via}. Never hangs.
+   */
+  async function fetchPage(url, opts = {}) {
+    const headers = opts.headers || {};
+    const signal = opts.signal;
+    if (!proxyState.checked) await probeLocalProxy();
+    const errors = [];
+
+    if (proxyState.local) {
+      try {
+        const page = await fetchViaLocalProxy(url, headers, signal);
+        localProxyFails = 0;
+        return page;
+      } catch (err) {
+        if (isAbortError(err, signal)) throw err;
+        errors.push(`proxy local : ${err.message}`);
+        localProxyFails++;
+        if (localProxyFails >= 3) {
+          // The server is up but cannot reach the internet (TLS interception,
+          // firewall, DNS…): switch to public proxies for the rest of the session.
+          proxyState.local = false;
+          proxyState.checked = true;
+          updateProxyBadge();
+          console.warn('[SitePlan] proxy local injoignable → repli sur les proxys publics.');
+        }
+      }
+    }
+
+    const authBlocked = Object.keys(headers).length > 0;
+    for (const proxy of PUBLIC_PROXIES) {
+      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+      if ((proxyFails.get(proxy.name) || 0) >= 3) continue;
+      try {
+        const page = await fetchViaPublicProxy(proxy, url, signal);
+        const blocked = detectBlockedPage(page.body);
+        if (blocked) { errors.push(`${proxy.name} : ${blocked}`); proxyFails.set(proxy.name, 1); continue; }
+        if (!page.body) { errors.push(`${proxy.name} : réponse vide`); proxyFails.set(proxy.name, 1); continue; }
+        proxyFails.delete(proxy.name);
+        return page;
+      } catch (err) {
+        if (isAbortError(err, signal)) throw err;
+        errors.push(`${proxy.name} : ${err.message}`);
+        const n = (proxyFails.get(proxy.name) || 0) + 1;
+        proxyFails.set(proxy.name, n);
+        if (n >= 3) console.warn(`[SitePlan] proxy ${proxy.name} désactivé pour cette session (${n} échecs).`);
+      }
+    }
+
+    const suffix = authBlocked
+      ? ' — les en-têtes d\'authentification ne fonctionnent qu\'avec le proxy local (node server.js)'
+      : '';
+    throw new Error(`aucun proxy n'a pu charger la page${suffix}${errors.length ? ` (${errors.slice(0, 3).join(' · ')})` : ''}`);
+  }
 
   // ---------- DOM ----------
   const $ = (s, r = document) => r.querySelector(s);
@@ -193,17 +413,33 @@
   }
 
   function extractLinks(html, base) {
-    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
     const set = new Set();
-    doc.querySelectorAll('a[href], link[rel="alternate"][href]').forEach((a) => {
-      const h = a.getAttribute('href');
-      if (h) set.add(h);
+    const push = (v) => { if (v) { const s = String(v).trim(); if (s) set.add(s); } };
+    doc.querySelectorAll('a[href], area[href]').forEach((a) => push(a.getAttribute('href')));
+    // alternates / canonical (useful for i18n and no-<a> pages)
+    doc.querySelectorAll('link[href]').forEach((l) => {
+      const rel = (l.getAttribute('rel') || '').toLowerCase();
+      if (rel.includes('alternate') || rel.includes('canonical')) push(l.getAttribute('href'));
     });
-    doc.querySelectorAll('loc').forEach((l) => {
-      if (l.textContent) set.add(l.textContent.trim());
-    });
+    doc.querySelectorAll('meta[property="og:url"], meta[name="twitter:url"]').forEach((m) => push(m.getAttribute('content')));
+    // sitemap XML pasted or fetched
+    doc.querySelectorAll('loc').forEach((l) => push(l.textContent));
     return Array.from(set);
   }
+
+  /** Returns {links, noindex, loginForm} for a fetched HTML page. */
+  function analyzePage(html) {
+    const doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
+    let noindex = false;
+    doc.querySelectorAll('meta[name="robots"], meta[name="googlebot"]').forEach((m) => {
+      const c = (m.getAttribute('content') || '').toLowerCase();
+      if (c.includes('noindex') || c.includes('none')) noindex = true;
+    });
+    const loginForm = !!doc.querySelector('input[type="password"]');
+    return { links: extractLinks(html), noindex, loginForm };
+  }
+
 
   // ---------- Project / ZIP scanning ----------
   function normalizeFileList(files) {
@@ -224,16 +460,39 @@
   /**
    * Scan a virtual file list (from folder upload OR zip) with {path, name, text(), lastModified}.
    */
+  /** Folder names that must never be stripped as a ZIP/folder "root". */
+  const KEEP_ROOT = new Set(['src', 'app', 'pages', 'public', 'docs', 'assets', 'static', 'components', 'lib', 'styles', 'css', 'js', 'img', 'images', 'fonts', 'content', 'routes', 'layouts', 'templates']);
+
+  /**
+   * GitHub/zips usually wrap everything in a single folder ("mon-site-main/").
+   * Detect it so framework config files are found at the expected location.
+   */
+  function stripCommonRoot(paths) {
+    if (!paths.length) return '';
+    const firsts = new Set();
+    for (const p of paths) {
+      const i = p.indexOf('/');
+      firsts.add(i > 0 ? p.slice(0, i) : '');
+      if (i <= 0) return '';
+    }
+    if (firsts.size !== 1) return '';
+    const root = [...firsts][0];
+    if (!root || KEEP_ROOT.has(root.toLowerCase())) return '';
+    return root + '/';
+  }
+
+  /** A single unreadable entry (corrupted / encrypted / huge) must never block the scan. */
+  function readTextSafe(fileObj, timeoutMs = 5000) {
+    return Promise.race([
+      Promise.resolve().then(() => fileObj.text()),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('lecture du fichier expirée')), timeoutMs)),
+    ]);
+  }
+
   async function scanFiles(fileObjects, sourceName = 'folder') {
     // Build paths
     const paths = fileObjects.map((f) => f.path);
-    // Determine common root for folder uploads
-    let rootPrefix = '';
-    if (sourceName === 'folder') {
-      const first = paths[0] || '';
-      const slash = first.indexOf('/');
-      if (slash > 0) rootPrefix = first.slice(0, slash + 1);
-    }
+    const rootPrefix = stripCommonRoot(paths);
     const rel = (p) => rootPrefix ? p.slice(rootPrefix.length) : p.replace(/^\/+/, '');
 
     const has = (p) => paths.some((x) => {
@@ -263,6 +522,15 @@
     } else if (has('.vitepress/config.js') || has('.vitepress/config.ts') || has('.vitepress/config.mjs')) {
       framework = 'vitepress';
       appDir = has('docs') ? 'docs' : '.';
+    } else if (paths.some((p) => /(^|\/)(src\/)?app\/page\.(t|j)sx?$/.test(rel(p)))
+      || paths.some((p) => /(^|\/)(src\/)?pages\/(index|_app|_document)\.(t|j)sx?$/.test(rel(p)))) {
+      // Next.js project without next.config.* (zips of a sub-folder, monorepos…)
+      framework = 'next-app';
+      appDir = has('src/app') ? 'src/app' : (has('app') ? 'app' : null);
+      pagesDir = has('src/pages') ? 'src/pages' : (has('pages') ? 'pages' : null);
+    } else if (paths.some((p) => /(^|\/)src\/pages\/.*\.astro$/.test(rel(p)))) {
+      framework = 'astro';
+      appDir = has('src/pages') ? 'src/pages' : 'pages';
     } else if (paths.some((p) => HTML_EXTS.test(p))) {
       framework = 'static-html';
     }
@@ -287,7 +555,8 @@
       return 'weekly';
     };
 
-    if ((framework === 'next-app') && appDir) {
+    if (framework === 'next-app' && (appDir || pagesDir)) {
+      if (appDir) {
       const pageRe = new RegExp(`^${appDir}/(.*)page\.(tsx|ts|jsx|js|mdx?)$`);
       paths.forEach((p) => {
         const rp = rel(p);
@@ -309,6 +578,7 @@
           lastmod: f?.lastModified ? new Date(f.lastModified).toISOString().slice(0,10) : null,
         });
       });
+      }
       if (pagesDir) {
         const pageRe = new RegExp(`^${pagesDir}/(.*)\.(tsx|ts|jsx|js|mdx?)$`);
         paths.forEach((p) => {
@@ -318,6 +588,7 @@
           let page = m[1];
           if (page.startsWith('api/') || page === 'api') return;
           if (page.startsWith('_')) return;
+          if (/^(404|500|_error)$/.test(page)) return; // pages d'erreur
           if (page === 'index') page = '';
           else page = page.replace(/\/index$/, '');
           const hasDynamic = /\[.*?\]/.test(page);
@@ -428,12 +699,13 @@
     const htmlFiles = fileObjects.filter((f) => HTML_EXTS.test(f.path) && !/(^|\/)(node_modules|\.git|\.next|dist|build)(\/|$)/.test(rel(f.path)));
     for (const f of htmlFiles) {
       try {
-        const txt = await f.text();
+        const txt = await readTextSafe(f, 8000);
+        if (!txt) continue;
         const links = extractLinks(txt, base);
         const lm = f.lastModified ? new Date(f.lastModified).toISOString().slice(0,10) : null;
         const r = addMany(links, 'html-scan', lm);
         linksAdded += r.added;
-      } catch {}
+      } catch { /* fichier illisible : on continue */ }
     }
 
     render();
@@ -461,6 +733,10 @@
           <span>✅ <strong style="color:#6ee7b7">${added}</strong> ajoutées</span>
         </div>
         ${dyn ? `<div class="scan-warn">⚠️ ${dyn} route(s) dynamique(s) détectée(s) (ex: <code>[slug]</code>). Elles sont marquées ⚡ dans le tableau. Remplacez-les par vos vraies URLs (base de données, etc.).</div>` : ''}
+        ${routes.length === 0 ? `<div class="scan-warn">⚠️ Aucune route détectée dans cette archive.<br>
+          • Vérifiez que le ZIP contient bien vos <strong>fichiers source</strong> (<code>app/</code>, <code>pages/</code>, <code>*.html</code>…), pas seulement un build minifié.<br>
+          • Les dossiers <code>node_modules/</code>, <code>.git/</code> et <code>__MACOSX/</code> sont ignorés.<br>
+          • Framework non reconnu ? Utilisez l'onglet « Fichiers HTML » ou le crawler.</div>` : ''}
       </div>
       <ul class="scan-list">
         ${routes.slice(0, 20).map((r) => `<li class="${r.dynamic ? 'dyn' : ''}"><span>${escapeXml(r.path)}</span> <span class="tag ${r.dynamic ? 'dyn' : ''}">${r.dynamic ? 'dyn' : r.priority}</span></li>`).join('')}
@@ -471,53 +747,196 @@
     updateStepper();
   }
 
+  function ensureBaseUrl() {
+    if ($('#baseUrl').value.trim()) return true;
+    showToast("Renseignez d'abord l'URL de base (étape ①) : elle sert à construire les URLs.", 'error');
+    const input = $('#baseUrl');
+    input.focus();
+    if (input.scrollIntoView) input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    return false;
+  }
+
+  function renderScanPanel(html) {
+    const res = $('#projectScanResult');
+    if (!res) return;
+    res.style.display = 'flex';
+    res.innerHTML = html;
+  }
+
+  function renderScanLoading(text) {
+    renderScanPanel(`<div style="padding:20px;text-align:center;">
+      <div class="spinner"></div>
+      <p style="margin:10px 0 0;color:var(--text-muted)">${escapeXml(text)}</p>
+    </div>`);
+  }
+
+  const ZIP_JUNK = /(^|\/)(__MACOSX|node_modules|\.git|\.svn|\.hg|\.idea|\.vscode|\.DS_Store|Thumbs\.db)(\/|$)|(^|\/)\._|\.DS_Store$/i;
+
   async function handleZip(file) {
     if (!window.JSZip) { showToast('JSZip non disponible.', 'error'); return; }
-    const res = $('#projectScanResult');
-    res.style.display = 'flex';
-    res.innerHTML = `<div style="padding:20px;text-align:center;">
-      <div style="display:inline-block;width:24px;height:24px;border:3px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin 1s linear infinite;"></div>
-      <p style="margin:10px 0 0;color:var(--text-muted)">Extraction du ZIP en cours…</p>
-    </div>`;
-    // Inject spin keyframe if not present
+    if (!file) return;
+    if (!ensureBaseUrl()) return;
+    if (file.size === 0) {
+      renderScanPanel('<div class="scan-badge err">✗ Fichier vide</div><p class="scan-err">Le ZIP fait 0 octet.</p>');
+      return;
+    }
+    renderScanLoading('Extraction du ZIP…');
     if (!$('#spin-kf')) {
       const s = document.createElement('style');
       s.id = 'spin-kf';
-      s.textContent = '@keyframes spin{to{transform:rotate(360deg)}}';
+      s.textContent = '@keyframes spin{to{transform:rotate(360deg)}}.spinner{display:inline-block;width:24px;height:24px;border:3px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin 1s linear infinite;}';
       document.head.appendChild(s);
     }
     try {
-      const zip = await JSZip.loadAsync(file);
+      const zip = await JSZip.loadAsync(file, { checkCRC32: false });
       const items = [];
+      let skipped = 0;
       for (const [relPath, entry] of Object.entries(zip.files)) {
         if (entry.dir) continue;
-        if (/(^|\/)__MACOSX(\/|$)/.test(relPath) || relPath.startsWith('.')) continue;
+        const clean = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
+        if (!clean || ZIP_JUNK.test(clean)) { skipped++; continue; }
         items.push({
-          name: relPath.split('/').pop(),
-          path: relPath,
+          name: clean.split('/').pop(),
+          path: clean,
           size: entry._data ? entry._data.uncompressedSize : 0,
           lastModified: entry.date ? entry.date.getTime() : null,
           text: () => entry.async('string'),
         });
       }
+      if (!items.length) {
+        throw new Error('Le ZIP ne contient aucun fichier exploitable (archive vide, ou uniquement node_modules/.git).');
+      }
+      if (items.length > 25000) {
+        throw new Error(`ZIP trop volumineux (${items.length} fichiers). Supprimez node_modules/ et .git/ avant de zipper.`);
+      }
+      renderScanLoading(`${items.length} fichiers trouvés — analyse des routes…`);
       await scanFiles(items, 'zip');
+      if (skipped) console.info(`[SitePlan] ${skipped} fichier(s) ignoré(s) (node_modules, .git, __MACOSX…).`);
     } catch (e) {
-      res.style.display = 'flex';
-      res.innerHTML = `<div class="scan-badge err">✗ Erreur ZIP</div><p style="margin:8px 0 0;color:#fda4af;font-size:13px;">${escapeXml(e.message)}</p>`;
+      const msg = /end of central directory|corrupted zip|not a zip/i.test(e.message || '')
+        ? "Ce fichier n'est pas un ZIP valide (ou il est protégé par mot de passe)."
+        : (e.message || 'Erreur inconnue');
+      renderScanPanel(`<div class="scan-badge err">✗ Erreur ZIP</div><p class="scan-err">${escapeXml(msg)}</p>`);
       showToast('Erreur lors de la lecture du ZIP.', 'error');
     }
   }
 
   // ---------- Crawler ----------
-  async function crawl(startUrl) {
-    const base = $('#baseUrl').value.trim() || startUrl;
-    const baseHost = new URL(base).host;
-    const max = parseInt($('#crawlMax').value, 10) || 500;
-    const delay = parseInt($('#crawlDelay').value, 10) || 0;
+  const crawlUI = { running: false };
 
-    const queue = [startUrl];
-    const visited = new Set();
-    let found = 0, errs = 0;
+  function setCrawlRunning(running) {
+    crawlUI.running = running;
+    const start = $('#startCrawl');
+    const stop = $('#stopCrawl');
+    if (start) start.disabled = running;
+    if (stop) {
+      stop.disabled = !running;
+      stop.textContent = '⏹ Arrêter';
+    }
+  }
+
+  /** Stop button: abort the in-flight request immediately (never wait for a timeout). */
+  function requestStopCrawl() {
+    if (!crawlUI.running || !crawlAbort) return;
+    crawlAbort.stopped = true;
+    try { crawlAbort.controller.abort(); } catch { /* ignore */ }
+    const stop = $('#stopCrawl');
+    if (stop) { stop.disabled = true; stop.textContent = '⏳ Arrêt…'; }
+    const log = $('#crawlLog');
+    if (log) {
+      const d = document.createElement('div');
+      d.className = 'warn';
+      d.textContent = '> Arrêt demandé — abandon de la requête en cours…';
+      log.insertBefore(d, log.firstChild);
+    }
+  }
+
+  const hostKey = (host) => String(host || '').toLowerCase().replace(/^www\./, '');
+
+  /** Read the site's sitemaps and robots.txt to seed URLs (works even if the home page is JS-only). */
+  async function seedFromSitemaps(origin, opts) {
+    const { signal, headers, log, addLoc, max, isAllowedHost } = opts;
+    const sitemapQueue = [];
+    const seenSitemaps = new Set();
+    let added = 0;
+
+    try {
+      const robots = await fetchPage(new URL('/robots.txt', origin).href, { signal, headers });
+      if (robots.status < 400 && robots.body) {
+        const lines = robots.body.split(/\r?\n/);
+        for (const line of lines) {
+          const m = line.match(/^\s*sitemap:\s*(\S+)/i);
+          if (m) sitemapQueue.push(m[1]);
+          if (/^\s*disallow:\s*\/\s*$/i.test(line)) {
+            log('⚠ robots.txt contient « Disallow: / » — le site refuse les robots, le crawl peut être bloqué.', 'warn');
+          }
+        }
+        if (sitemapQueue.length) log(`robots.txt : ${sitemapQueue.length} sitemap(s) référencé(s).`, 'info');
+      }
+    } catch { /* pas de robots.txt : normal */ }
+
+    if (!sitemapQueue.length) {
+      sitemapQueue.push(new URL('/sitemap.xml', origin).href, new URL('/sitemap_index.xml', origin).href);
+    }
+
+    while (sitemapQueue.length && seenSitemaps.size < 12 && added < max) {
+      if (signal.aborted) break;
+      const smUrl = sitemapQueue.shift();
+      if (seenSitemaps.has(smUrl)) continue;
+      seenSitemaps.add(smUrl);
+      let page;
+      try { page = await fetchPage(smUrl, { signal, headers }); } catch { continue; }
+      if (page.status >= 400 || !page.body) continue;
+      let doc;
+      try { doc = new DOMParser().parseFromString(page.body, 'application/xml'); } catch { continue; }
+      if (!doc || doc.querySelector('parsererror')) continue;
+      // sitemap index → follow children
+      doc.querySelectorAll('sitemap > loc').forEach((n) => {
+        const v = (n.textContent || '').trim();
+        if (v) sitemapQueue.push(v);
+      });
+      const locs = Array.from(doc.querySelectorAll('url > loc'))
+        .map((n) => (n.textContent || '').trim())
+        .filter((v) => /^https?:\/\//i.test(v));
+      if (!locs.length) continue;
+      let usable = 0;
+      for (const loc of locs) {
+        if (added >= max) break;
+        let host;
+        try { host = new URL(loc).hostname; } catch { continue; }
+        if (!isAllowedHost(host)) continue;
+        if (addLoc(loc)) { added++; usable++; }
+      }
+      let label = smUrl;
+      try { label = new URL(smUrl).pathname; } catch { /* ignore */ }
+      log(`✓ sitemap ${label} : ${locs.length} URL(s), ${usable} ajoutée(s).`, 'ok');
+    }
+    return added;
+  }
+
+  async function crawl(startUrl) {
+    if (crawlUI.running) return;
+
+    const baseInput = ($('#baseUrl').value || '').trim() || startUrl;
+    let baseObj;
+    try { baseObj = new URL(baseInput); } catch {
+      showToast('URL de base invalide.', 'error');
+      return;
+    }
+    const start = normalizeUrl(startUrl, baseObj.href);
+    if (!start) { showToast('URL de départ invalide.', 'error'); return; }
+
+    const max = Math.max(1, Math.min(10000, parseInt($('#crawlMax').value, 10) || 500));
+    const delay = Math.max(0, parseInt($('#crawlDelay').value, 10) || 0);
+    const skipNoindex = $('#crawlSkipNoindex') ? $('#crawlSkipNoindex').checked : true;
+    const allowSubdomains = $('#crawlSubdomains') ? $('#crawlSubdomains').checked : false;
+    const headers = getCrawlHeaders();
+    const baseHost = hostKey(baseObj.hostname);
+    const isAllowedHost = (host) => {
+      const h = hostKey(host);
+      return h === baseHost || (allowSubdomains && h.endsWith('.' + baseHost));
+    };
+
     const log = $('#crawlLog');
     log.innerHTML = '';
     const addLog = (msg, cls = '') => {
@@ -525,65 +944,210 @@
       if (cls) li.className = cls;
       li.textContent = msg;
       log.insertBefore(li, log.firstChild);
-      while (log.children.length > 80) log.removeChild(log.lastChild);
+      while (log.children.length > 120) log.removeChild(log.lastChild);
     };
+
     $('#crawlProgress').style.display = 'block';
-    addLog(`> Démarrage depuis ${startUrl} (max ${max})`, 'info');
-    crawlAbort = { stopped: false };
+    $('#crawlFound').textContent = '0';
+    $('#crawlQueue').textContent = '0';
+    $('#crawlErrors').textContent = '0';
+    $('#crawlFill').style.width = '0%';
+    setCrawlRunning(true);
+    crawlAbort = { stopped: false, controller: new AbortController() };
+    const abort = crawlAbort;
+    const signal = abort.controller.signal;
+
+    const queue = [];
+    const enqueued = new Set();
+    const visited = new Set();
+    let found = 0, errs = 0, duplicates = 0, noindexSkipped = 0;
+    let renderTimer = null;
+
     const tick = () => {
-      $('#crawlFound').textContent = found;
-      $('#crawlQueue').textContent = queue.length;
-      $('#crawlErrors').textContent = errs;
+      $('#crawlFound').textContent = String(found);
+      $('#crawlQueue').textContent = String(queue.length);
+      $('#crawlErrors').textContent = String(errs);
       $('#crawlFill').style.width = Math.min(100, (found / max) * 100) + '%';
     };
-    const fetchWithProxy = async (url) => {
-      for (const p of CORS_PROXIES) {
-        try { const r = await fetch(p(url), { redirect: 'follow' }); if (r.ok) return await r.text(); } catch {}
-      }
-      try { const r = await fetch(url); if (r.ok) return await r.text(); } catch {}
-      throw new Error('Tous les proxys ont échoué');
+    const scheduleRender = () => {
+      if (renderTimer) return;
+      renderTimer = setTimeout(() => { renderTimer = null; render(); }, 400);
     };
-    while (queue.length > 0 && found < max && !crawlAbort.stopped) {
-      const url = queue.shift();
-      if (visited.has(url)) continue;
-      visited.add(url);
-      tick();
-      try {
-        const html = await fetchWithProxy(url);
-        const links = extractLinks(html, url);
-        const r = addUrl(url, { source: 'crawl', fromCrawl: true });
-        if (r.ok) found++;
-        for (const h of links) {
-          const n = normalizeUrl(h, url);
-          if (!n) continue;
-          try { if (new URL(n).host !== baseHost) continue; } catch { continue; }
-          if (isExcluded(n, { crawl: true })) continue;
-          if (!visited.has(n) && !queue.includes(n) && queue.length < max * 2) queue.push(n);
-        }
-        addLog(`✓ ${url}`, 'ok');
-        if (delay) await new Promise((r) => setTimeout(r, delay));
-        render();
-      } catch (e) {
-        errs++; addLog(`✗ ${url} — ${e.message}`, 'err');
+    const addLoc = (loc) => {
+      const r = addUrl(loc, { source: 'crawl', fromCrawl: true });
+      if (r.ok) { found++; return true; }
+      if (r.reason === 'duplicate') duplicates++;
+      return false;
+    };
+    const push = (raw, fromUrl) => {
+      const n = normalizeUrl(raw, fromUrl || baseObj.href);
+      if (!n) return false;
+      let u;
+      try { u = new URL(n); } catch { return false; }
+      if (!isAllowedHost(u.hostname)) return false;
+      if (isExcluded(n, { crawl: true })) return false;
+      if (visited.has(n) || enqueued.has(n)) return false;
+      if (queue.length >= max * 3) return false;
+      enqueued.add(n);
+      queue.push(n);
+      return true;
+    };
+
+    let stoppedByUser = false;
+    proxyFails.clear();
+    localProxyFails = 0;
+    try {
+      await probeLocalProxy(true);
+      addLog(`> Démarrage depuis ${start} (max ${max})`, 'info');
+      if (proxyState.local) {
+        addLog(`Réseau : proxy local${Object.keys(headers).length ? ' + en-têtes d\'authentification' : ''}.`, 'info');
+      } else {
+        addLog('Réseau : proxys publics (CORS). Pour un résultat fiable et les sites protégés, lancez « node server.js ».', 'warn');
+        if (Object.keys(headers).length) addLog('⚠ Cookie / Authorization ignorés : ils nécessitent le proxy local.', 'warn');
       }
+
+      if (!isAllowedHost(new URL(start).hostname)) {
+        addLog(`⚠ L'URL de départ n'est pas sur le domaine de base (${baseObj.hostname}) — vérifiez l'URL de base.`, 'warn');
+      }
+
+      // 1. Seed with robots.txt + sitemap(s): fast and covers JS-rendered sites.
+      const seeded = await seedFromSitemaps(baseObj.origin, { signal, headers, log: addLog, addLoc, max, isAllowedHost });
+      if (seeded) {
+        addLog(`> ${seeded} URL(s) ajoutée(s) depuis les sitemaps.`, 'ok');
+        tick(); scheduleRender();
+      }
+      if (abort.stopped) throw new DOMException('aborted', 'AbortError');
+
+      // 2. Breadth-first crawl from the start URL.
+      push(start);
+      let authHintShown = false;
+      while (queue.length && !abort.stopped && found < max) {
+        const url = queue.shift();
+        enqueued.delete(url);
+        if (visited.has(url)) continue;
+        visited.add(url);
+        tick();
+
+        let page;
+        try {
+          page = await fetchPage(url, { signal, headers });
+        } catch (err) {
+          if (abort.stopped || isAbortError(err, signal)) break;
+          errs++;
+          addLog(`✗ ${url} — ${err.message}`, 'err');
+          if (!authHintShown) {
+            authHintShown = true;
+            addLog('ℹ Si le site est privé/protégé : lancez « node server.js », ouvrez http://localhost:8080 et renseignez un Cookie ou un token.', 'warn');
+          }
+          tick();
+          continue;
+        }
+
+        if (abort.stopped) break;
+
+        if (page.status >= 400) {
+          errs++;
+          const hint = (page.status === 401 || page.status === 403)
+            ? ' (accès protégé — ajoutez un Cookie/Authorization via le proxy local)'
+            : '';
+          addLog(`✗ ${url} — HTTP ${page.status}${hint}`, 'err');
+          tick();
+          continue;
+        }
+
+        const ct = (page.contentType || '').toLowerCase();
+        if (ct && !/text\/html|application\/xhtml|text\/plain|application\/xml/.test(ct)) {
+          addLog(`↷ ${url} — ignoré (${ct.split(';')[0]})`, 'warn');
+          continue;
+        }
+
+        const effective = page.finalUrl || url;
+        const analysis = analyzePage(page.body);
+
+        if (analysis.loginForm && analysis.links.length < 6 && !proxyState.local) {
+          addLog(`⚠ ${url} ressemble à une page de connexion : le contenu réel est derrière un login.`, 'warn');
+        }
+
+        if (skipNoindex && analysis.noindex) {
+          noindexSkipped++;
+          addLog(`↷ ${url} — noindex, non ajoutée`, 'warn');
+        } else {
+          let effectiveHost = '';
+          try { effectiveHost = new URL(effective).hostname; } catch { /* ignore */ }
+          if (effectiveHost && isAllowedHost(effectiveHost)) {
+            const r = addUrl(effective, { source: 'crawl', fromCrawl: true });
+            if (r.ok) found++;
+            else if (r.reason === 'duplicate') duplicates++;
+          }
+          addLog(`✓ ${url}${page.via && page.via !== 'proxy local' ? ` (via ${page.via})` : ''}`, 'ok');
+        }
+
+        for (const raw of analysis.links) {
+          push(raw, effective);
+        }
+
+        tick();
+        scheduleRender();
+        if (delay) await sleep(delay, signal);
+      }
+
+      stoppedByUser = abort.stopped;
+    } catch (err) {
+      if (!isAbortError(err, signal) && !abort.stopped) {
+        addLog(`✗ Erreur inattendue : ${err.message}`, 'err');
+      }
+      stoppedByUser = abort.stopped;
+    } finally {
+      if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+      if (stoppedByUser) addLog(`> Crawl arrêté par l'utilisateur (${found} URL(s) conservée(s)).`, 'warn');
+      else if (found >= max) addLog(`> Limite de ${max} URLs atteinte.`, 'ok');
+      else addLog(`> Terminé : ${found} URL(s) trouvée(s), ${errs} erreur(s)${duplicates ? `, ${duplicates} déjà présente(s)` : ''}${noindexSkipped ? `, ${noindexSkipped} noindex ignorée(s)` : ''}.`, 'ok');
+      $('#crawlQueue').textContent = '0';
+      crawlAbort = null;
+      setCrawlRunning(false);
+      render(); saveState(); updateStepper();
     }
-    if (crawlAbort.stopped) addLog('> Arrêté par l\'utilisateur.', 'warn');
-    else addLog(`> Terminé : ${found} pages trouvées.`, 'ok');
-    crawlAbort = null;
-    render(); saveState(); updateStepper();
   }
 
   // ---------- Sitemap import ----------
   async function importSitemapFromUrl(url) {
+    const btn = $('#importSitemapUrl');
+    const prevLabel = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Import…'; }
     try {
-      let text = null;
-      for (const p of CORS_PROXIES) {
-        try { const r = await fetch(p(url)); if (r.ok) { text = await r.text(); break; } } catch {}
+      await probeLocalProxy();
+      const seen = new Set();
+      const pending = [url];
+      const all = [];
+      const errors = [];
+      while (pending.length && seen.size < 20) {
+        const sm = pending.shift();
+        if (seen.has(sm)) continue;
+        seen.add(sm);
+        let page;
+        try { page = await fetchPage(sm); } catch (e) { errors.push(e.message); continue; }
+        if (page.status >= 400) { errors.push(`${sm} → HTTP ${page.status}`); continue; }
+        const doc = new DOMParser().parseFromString(page.body, 'application/xml');
+        if (doc.querySelector('parsererror')) { errors.push(`${sm} → XML invalide`); continue; }
+        const children = Array.from(doc.querySelectorAll('sitemap > loc')).map((n) => n.textContent.trim()).filter(Boolean);
+        const locs = Array.from(doc.querySelectorAll('url > loc')).map((n) => n.textContent.trim()).filter(Boolean);
+        if (children.length && !locs.length) { children.forEach((c) => pending.push(c)); continue; }
+        all.push(...locs);
       }
-      if (!text) { const r = await fetch(url); text = await r.text(); }
-      parseAndImportSitemap(text);
-    } catch (e) { showToast('Erreur: ' + e.message, 'error'); }
+      if (!all.length) {
+        showToast(errors[0] ? `Import impossible : ${errors[0]}` : 'Aucune URL trouvée dans ce sitemap.', 'error');
+        return;
+      }
+      const r = addMany(all, 'import');
+      render(); saveState(); updateStepper();
+      showToast(`${r.added} URL(s) importée(s) sur ${all.length}${seen.size > 1 ? ` (${seen.size} sitemaps)` : ''}.`, r.added ? 'success' : 'error');
+    } catch (e) {
+      showToast('Erreur : ' + e.message, 'error');
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = prevLabel || 'Importer'; }
+    }
   }
+
   function parseAndImportSitemap(text) {
     const doc = new DOMParser().parseFromString(text, 'application/xml');
     const sitemaps = Array.from(doc.querySelectorAll('sitemap > loc')).map((n) => n.textContent.trim());
@@ -931,7 +1495,7 @@
       if (ev === 'dragleave' && el.contains(e.relatedTarget)) return;
       el.classList.remove('dragover');
     }));
-    el.addEventListener('drop', (e) => { if (e.dataTransfer) onFiles(e.dataTransfer.files); });
+    el.addEventListener('drop', (e) => { if (e.dataTransfer) onFiles(e.dataTransfer.files, e.dataTransfer); });
   }
 
   // ---------- Hreflang ----------
@@ -952,6 +1516,8 @@
 
   // ---------- Init ----------
   function init() {
+    if (initialized) return; // DOMContentLoaded can fire twice (e.g. re-dispatch)
+    initialized = true;
     $('#defaultLastmod').value = todayIso();
     loadState();
     updateLastmod(); updateHreflang();
@@ -977,10 +1543,10 @@
     });
 
     // Project dropzone (ZIP + folder)
-    wireDropzone($('#projectDropzone'), (files) => {
-      if (!files.length) return;
-      if (!$('#baseUrl').value.trim()) { showToast('Veuillez d\'abord saisir l\'URL de base.', 'error'); return; }
-      handleProjectFiles(files);
+    wireDropzone($('#projectDropzone'), (files, dataTransfer) => {
+      if (!ensureBaseUrl()) return;
+      if ((!files || !files.length) && !dataTransfer) return;
+      handleProjectFiles(files, dataTransfer);
     }, [$('#pickZip'), $('#pickFolder')]);
     $('#pickZip').addEventListener('click', (e) => { e.stopPropagation(); $('#zipInput').click(); });
     $('#pickFolder').addEventListener('click', (e) => { e.stopPropagation(); $('#folderInput').click(); });
@@ -989,8 +1555,8 @@
       e.target.value = '';
     });
     $('#folderInput').addEventListener('change', (e) => {
-      if (e.target.files.length) {
-        if (!$('#baseUrl').value.trim()) { showToast('Veuillez d\'abord saisir l\'URL de base.', 'error'); return; }
+      if (e.target.files.length && ensureBaseUrl()) {
+        renderScanLoading(`${e.target.files.length} fichiers trouvés — analyse des routes…`);
         scanFiles(normalizeFileList(e.target.files), 'folder');
       }
       e.target.value = '';
@@ -1054,15 +1620,29 @@
       showToast(`${filename} téléchargé.`, 'success');
     });
     $('#startCrawl').addEventListener('click', () => {
+      if (crawlUI.running) return;
       const u = $('#crawlStart').value.trim() || $('#baseUrl').value.trim();
       if (!u) { showToast('URL de départ requise.', 'error'); return; }
       const start = normalizeUrl(u, u);
       if (!start) { showToast('URL invalide.', 'error'); return; }
       if (!$('#baseUrl').value.trim()) $('#baseUrl').value = start;
-      $('#crawlProgress').style.display = 'none';
-      setTimeout(() => crawl(start), 80);
+      $('#crawlStart').value = start;
+      saveState();
+      crawl(start);
     });
-    $('#stopCrawl').addEventListener('click', () => { if (crawlAbort) crawlAbort.stopped = true; });
+    $('#crawlStart').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); $('#startCrawl').click(); }
+    });
+    $('#stopCrawl').addEventListener('click', requestStopCrawl);
+    $('#stopCrawl').disabled = true;
+    $('#recheckProxy').addEventListener('click', async () => {
+      proxyState.checked = false;
+      updateProxyBadge();
+      await probeLocalProxy(true);
+      showToast(proxyState.local ? 'Proxy local disponible ✓' : 'Proxy local indisponible — proxys publics utilisés.', proxyState.local ? 'success' : 'error');
+    });
+    updateProxyBadge();
+    probeLocalProxy();
     $('#importSitemapUrl').addEventListener('click', () => {
       const u = $('#sitemapUrl').value.trim();
       if (!u) { showToast('URL requise.', 'error'); return; }
@@ -1094,8 +1674,23 @@
 
     render(); updateStepper();
 
-    // Also prevent drop of files outside dropzones from opening the browser
+    // Prevent the browser from opening dropped files, and still handle drops
+    // that happen outside a dropzone (very common "it does nothing" case).
     ['dragover','drop'].forEach((ev) => window.addEventListener(ev, (e) => e.preventDefault()));
+    window.addEventListener('drop', (e) => {
+      const dt = e.dataTransfer;
+      if (!dt || !dt.files || !dt.files.length) return;
+      const files = Array.from(dt.files);
+      const zips = files.filter((f) => /\.zip$/i.test(f.name));
+      if (zips.length) { handleZip(zips[0]); return; }
+      const html = files.filter((f) => HTML_EXTS.test(f.name));
+      if (html.length) { handleHtmlFiles(html); return; }
+      if (files.every((f) => /\.xml$/i.test(f.name))) {
+        readFileAsText(files[0]).then(parseAndImportSitemap).catch((err) => showToast('Erreur: ' + err.message, 'error'));
+        return;
+      }
+      showToast('Format non reconnu : déposez un .zip, des .html/.php ou un .xml.', 'error');
+    });
   }
 
   function fallbackCopy(text) {
@@ -1107,22 +1702,86 @@
   }
 
   // ---------- Multi-source handler for drag-drop ----------
-  async function handleProjectFiles(fileList) {
-    const files = Array.from(fileList);
-    // Detect if it's a single zip
-    if (files.length === 1 && files[0].name.toLowerCase().endsWith('.zip')) {
-      handleZip(files[0]);
+  /** Recursively read a drag-and-dropped directory entry (Chrome/Edge/Safari). */
+  async function readEntry(entry, prefix = '') {
+    if (!entry) return [];
+    if (entry.isFile) {
+      const file = await new Promise((res, rej) => entry.file(res, rej));
+      return [{ file, path: prefix + file.name }];
+    }
+    if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const children = await new Promise((res, rej) => {
+        const out = [];
+        const read = () => reader.readEntries((batch) => {
+          if (!batch.length) return res(out);
+          out.push(...batch);
+          read();
+        }, rej);
+        read();
+      });
+      const out = [];
+      for (const child of children) out.push(...await readEntry(child, prefix + entry.name + '/'));
+      return out;
+    }
+    return [];
+  }
+
+  /** Files dropped as a folder arrive empty through dataTransfer.files → use webkitGetAsEntry. */
+  async function filesFromDataTransfer(dt) {
+    const entries = [];
+    if (dt && dt.items) {
+      for (const item of Array.from(dt.items)) {
+        if (item.kind !== 'file') continue;
+        const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+        if (entry) entries.push(entry);
+      }
+    }
+    if (!entries.length) {
+      return Array.from((dt && dt.files) || []).map((file) => ({ file, path: file.webkitRelativePath || file.name }));
+    }
+    const pairs = [];
+    for (const entry of entries) pairs.push(...await readEntry(entry, ''));
+    return pairs;
+  }
+
+  function pairsToScanItems(pairs) {
+    return pairs.map(({ file, path }) => ({
+      name: file.name,
+      path: (path || file.name).replace(/\\/g, '/'),
+      size: file.size,
+      lastModified: file.lastModified,
+      text: () => readFileAsText(file),
+    }));
+  }
+
+  async function handleProjectFiles(fileList, dataTransfer) {
+    if (!ensureBaseUrl()) return;
+    let pairs = [];
+    if (dataTransfer) {
+      try { pairs = await filesFromDataTransfer(dataTransfer); } catch { pairs = []; }
+    }
+    if (!pairs.length) {
+      pairs = Array.from(fileList || []).map((file) => ({ file, path: file.webkitRelativePath || file.name }));
+    }
+    if (!pairs.length) { showToast('Aucun fichier détecté dans le dépôt.', 'error'); return; }
+
+    const zips = pairs.filter((p) => /\.zip$/i.test(p.file.name));
+    if (zips.length === pairs.length) {
+      if (zips.length > 1) showToast('Plusieurs ZIP déposés : seul le premier est analysé.', 'error');
+      handleZip(zips[0].file);
       return;
     }
-    // Multiple files or a folder — check if any is a zip
-    const zips = files.filter((f) => f.name.toLowerCase().endsWith('.zip'));
-    if (zips.length && files.length === zips.length) {
-      // If multiple zips, only handle first for now
-      handleZip(zips[0]);
+    if (zips.length) showToast('Les .zip déposés avec d\'autres fichiers sont ignorés — déposez le ZIP seul.', 'error');
+
+    const files = pairs.filter((p) => !/\.zip$/i.test(p.file.name));
+    if (!files.length) return;
+    if (files.length > 25000) {
+      renderScanPanel(`<div class="scan-badge err">✗ Trop de fichiers</div><p class="scan-err">${files.length} fichiers déposés (limite 25 000). Déposez un ZIP sans node_modules.</p>`);
       return;
     }
-    // Otherwise treat as folder / files
-    scanFiles(normalizeFileList(files), 'folder');
+    renderScanLoading(`${files.length} fichiers trouvés — analyse des routes…`);
+    await scanFiles(pairsToScanItems(files), 'folder');
   }
 
   async function handleHtmlFiles(files) {

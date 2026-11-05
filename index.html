@@ -64,7 +64,7 @@
         <div class="hero-meta">
           <div class="meta-chip">✓ Framework auto-détecté</div>
           <div class="meta-chip">✓ Multilingue (hreflang)</div>
-          <div class="meta-chip">✓ Aucun serveur</div>
+          <div class="meta-chip">✓ Proxy local optionnel</div>
         </div>
       </div>
       <div class="hero-visual">
@@ -307,6 +307,47 @@
             </button>
           </div>
         </div>
+        <div class="crawl-transport">
+          <span class="proxy-dot pending" id="proxyDot"></span>
+          <span class="proxy-label" id="proxyLabel">Vérification du proxy local…</span>
+          <button type="button" class="btn btn-ghost btn-sm" id="recheckProxy">Re-tester</button>
+        </div>
+
+        <div class="crawl-options">
+          <label class="chk"><input type="checkbox" id="crawlSubdomains" /><span>Inclure les sous-domaines</span></label>
+          <label class="chk"><input type="checkbox" id="crawlSkipNoindex" checked /><span>Ignorer les pages <code>noindex</code></span></label>
+        </div>
+
+        <details class="advanced crawl-auth">
+          <summary>
+            <span class="adv-icon">🔐</span> Site protégé (connexion, staging…)
+            <span class="adv-hint">cookie, jeton, user-agent</span>
+          </summary>
+          <div class="advanced-body">
+            <p class="auth-note">
+              Un site derrière une authentification ne peut pas être lu par le navigateur seul.
+              Lancez <code>node server.js</code>, ouvrez <code>http://localhost:8080</code>, puis remplissez les champs
+              ci-dessous : ils seront envoyés à <strong>chaque requête</strong> du crawler.
+            </p>
+            <div class="form-row">
+              <label for="crawlCookie">Cookie</label>
+              <textarea id="crawlCookie" rows="2" spellcheck="false" placeholder="session=abc123; auth_token=…"></textarea>
+              <small>Copiez l'en-tête <code>Cookie</code> depuis l'onglet Réseau des DevTools, sur une page déjà connectée.</small>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label for="crawlAuthorization">Authorization / Bearer</label>
+                <input type="text" id="crawlAuthorization" spellcheck="false" autocomplete="off" placeholder="Bearer eyJ…" />
+              </div>
+              <div>
+                <label for="crawlUserAgent">User-Agent (optionnel)</label>
+                <input type="text" id="crawlUserAgent" spellcheck="false" autocomplete="off" placeholder="Mozilla/5.0 …" />
+              </div>
+            </div>
+            <p class="auth-warn">🔒 Ces valeurs restent en mémoire de l'onglet : elles ne sont ni sauvegardées ni envoyées ailleurs qu'au site crawlé.</p>
+          </div>
+        </details>
+
         <div class="crawl-panel" id="crawlProgress" style="display:none;">
           <div class="progress">
             <div class="progress-fill" id="crawlFill"></div>
@@ -554,7 +595,7 @@
         </span>
         SitePlan
       </div>
-      <p>100% local · aucune télémétrie · vos fichiers ne quittent pas votre navigateur.</p>
+      <p>100% local · aucune télémétrie · vos fichiers restent dans le navigateur · proxy de crawl optionnel sur votre machine.</p>
     </div>
   </footer>
 
