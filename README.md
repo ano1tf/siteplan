@@ -76,6 +76,63 @@ sauf le crawler (pas de réseau autorisé en `file://`), à utiliser via les imp
 
 Les valeurs restent en mémoire de l'onglet (jamais écrites dans le `localStorage`).
 
+## ☁️ Déploiement : Netlify ou Render ?
+
+L'interface est **un site statique** (aucun build, aucune dépendance). Le seul besoin
+d'un serveur concerne le **crawler** : sans lui, il passe par des proxys CORS publics
+(lents, bloqués par certains sites, et **impossible d'envoyer un cookie**).
+
+| Cible | Type | Crawl fiable | Sites protégés (cookie) | Effort |
+| --- | --- | --- | --- | --- |
+| **Netlify** (recommandé) | statique + 2 fonctions serverless | ✅ | ✅ | 0 config (fichiers fournis) |
+| **Render** | Web Service Node | ✅ | ✅ | start `node server.js` |
+| GitHub Pages / S3 / statique pur | statique seul | ⚠️ proxys publics | ❌ | 0 |
+
+Les deux premières options utilisent **le même code** (`lib/proxy.js`) et exposent le
+même contrat `/api/health` + `/api/fetch` : l'interface le détecte automatiquement
+(badge vert « Proxy local actif »).
+
+### Netlify — site statique + fonctions (recommandé)
+
+`netlify.toml` est déjà prêt : publication à la racine, fonctions dans `netlify/functions`,
+redirections `/api/health` et `/api/fetch` vers les fonctions.
+
+```bash
+# 1. pousser le dépôt sur GitHub, puis « Add new site → Import an existing project »
+# 2. Build command  : (vide)
+# 3. Publish dir    : .
+# 4. Deploy
+```
+
+Aucune variable d'environnement n'est nécessaire. En option :
+
+- `SITEPLAN_TIMEOUT_MS` — délai réseau des fonctions (défaut `8000`).
+  ⚠️ Netlify coupe les fonctions synchrones à **10 s** : n'augmentez pas au-delà de ~9000.
+- `SITEPLAN_ALLOW_PRIVATE=1` — inutile en production (bloqué par la plateforme), utile seulement en local.
+
+> Un site lent dont le serveur met > 8 s à répondre produira une erreur de crawl sur Netlify.
+> Dans ce cas, réduisez le nombre d'URLs ou passez sur Render.
+
+### Render — Web Service
+
+```
+Environment     : Node
+Build Command   : npm install        # aucune dépendance, quasi instantané
+Start Command   : node server.js     # ou: npm start
+Health Check    : /api/health
+```
+
+Render fournit `PORT`, le serveur l'utilise automatiquement. Le proxy n'a pas de limite
+de 10 s (`SITEPLAN_TIMEOUT_MS=25000` par défaut), ce qui est plus confortable pour de
+gros sites.
+
+### Hébergeur statique pur (GitHub Pages, S3…)
+
+Ça fonctionne pour tout **sauf le crawl authentifié** : le crawler utilisera les proxys
+CORS publics. Si vous voulez garder un hébergement statique mais un crawl fiable, copiez
+`lib/proxy.js` + `netlify/functions/fetch.js` vers un Cloudflare Worker ou une fonction
+Vercel (`/api/health` + `/api/fetch`) : le contrat est identique.
+
 ## 🧠 Exemple avec un projet Next.js (comme 4ur)
 
 1. Saisissez `https://4ur.fr` dans "URL de base".
@@ -88,11 +145,15 @@ Les valeurs restent en mémoire de l'onglet (jamais écrites dans le `localStora
 
 ```
 siteplan/
-├── index.html   # Interface
-├── styles.css   # Design
-├── app.js       # Logique (scan, crawl, exports)
-├── server.js    # Serveur statique + proxy de crawl (optionnel, zéro dépendance)
-├── jszip.min.js # Lecture des archives ZIP
+├── index.html              # Interface (statique)
+├── styles.css              # Design
+├── app.js                  # Logique (scan, crawl, exports)
+├── jszip.min.js            # Lecture des archives ZIP
+├── server.js               # Serveur statique + proxy de crawl (local / Render)
+├── lib/proxy.js            # Cœur du proxy, partagé serveur + serverless
+├── netlify/functions/      # /api/health + /api/fetch pour un déploiement Netlify
+├── netlify.toml            # Config Netlify (publish + redirects + fonctions)
+├── package.json            # `npm start` pour Render (aucune dépendance)
 └── README.md
 ```
 
@@ -107,3 +168,5 @@ natifs de Node (≥ 18, pour `fetch`).
 | « HTTP 401 / 403 » dans les logs | site derrière une connexion | renseignez `Cookie` / `Authorization` (proxy local requis) |
 | `node server.js` → « adresse privée bloquée » | crawl de `localhost` / IP privée | `SITEPLAN_ALLOW_PRIVATE=1 node server.js` |
 | Le ZIP analyse 0 route | ZIP d'un build minifié, ou URL de base vide | déposez les **sources** (ou `dist/` avec les `.html`) et renseignez l'URL de base |
+| Badge orange « Proxys publics » après déploiement | fonctions absentes ou non routées | vérifiez `netlify.toml` (redirects `/api/*`) ou que Render tourne bien `node server.js` |
+| Crawl en erreur au-delà de ~8 s sur Netlify | limite de 10 s des fonctions synchrones | augmentez `SITEPLAN_TIMEOUT_MS` (max 9000) ou passez sur Render |

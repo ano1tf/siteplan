@@ -120,7 +120,7 @@
     } else {
       dot.classList.add('off');
       label.innerHTML = 'Proxys publics — certains sites bloquent/limitent. Pour un crawl fiable' +
-        ' et les sites protégés, lancez <code>node server.js</code>.';
+        ' (et les sites protégés) : <code>node server.js</code> en local, ou un déploiement Netlify (fonctions incluses).';
     }
   }
 

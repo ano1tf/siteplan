@@ -1,0 +1,39 @@
+# SitePlan — déploiement Netlify
+# Le site reste 100% statique ; deux fonctions serverless fournissent le proxy
+# de crawl (même contrat que server.js) sous /api/*.
+
+[build]
+  publish = "."
+  functions = "netlify/functions"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# Le proxy de crawl
+[[redirects]]
+  from = "/api/health"
+  to = "/.netlify/functions/health"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/fetch"
+  to = "/.netlify/functions/fetch"
+  status = 200
+  force = true
+
+# Ne pas exposer les sources serveur dans le déploiement statique
+[[redirects]]
+  from = "/server.js"
+  to = "/404.html"
+  status = 404
+
+[[redirects]]
+  from = "/lib/*"
+  to = "/404.html"
+  status = 404
+
+[[redirects]]
+  from = "/netlify/*"
+  to = "/404.html"
+  status = 404
